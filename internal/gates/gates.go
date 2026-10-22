@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -59,6 +60,8 @@ func Discover(root string) ([]model.Gate, error) {
 			out = append(out, makeGates(path, rel)...)
 		case name == "project.yml", name == "project.yaml":
 			out = append(out, xcodegenGates(path, rel)...)
+		case hookStage(rel) != "":
+			out = append(out, hookGates(path, rel, hookStage(rel))...)
 		case strings.HasSuffix(name, ".rego"):
 			out = append(out, model.Gate{
 				ID: gid(rel, name), Kind: model.KindOPA, File: rel, Line: 1,
@@ -477,6 +480,62 @@ func srcRoot(script, dir string) string {
 		}
 	}
 	return script
+}
+
+// hookDirs are where a repository keeps git hooks it ships, enabled with
+// `git config core.hooksPath <dir>` or by husky. .git/hooks is not among them:
+// nothing there is versioned, so nothing there is a claim the repository makes.
+var hookDirs = map[string]bool{".githooks": true, ".git-hooks": true, "githooks": true, ".husky": true}
+
+// hookStage is the stage of the git hook at rel, or "" when rel is not a hook
+// that can stop work: a post- hook runs after the fact and fails nothing.
+func hookStage(rel string) model.Stage {
+	if !hookDirs[filepath.Base(filepath.Dir(rel))] {
+		return ""
+	}
+	switch filepath.Base(rel) {
+	case "pre-commit", "prepare-commit-msg", "commit-msg", "pre-merge-commit":
+		return model.PreCommit
+	case "pre-push":
+		return model.PrePush
+	}
+	return ""
+}
+
+// hookGates makes each command in a hook script a gate, as each run step of a CI
+// job is.
+//
+// A gate is named by its command, not by its hook. "pre-commit" is git's word,
+// not the repository's: as a name it would offer "commit" to every rule that
+// mentions committing, and link a rule about secrets to a lint hook.
+func hookGates(path, rel string, stage model.Stage) []model.Gate {
+	if !runnableHook(path, rel) {
+		return nil
+	}
+	lines, err := readLines(path)
+	if err != nil {
+		return nil
+	}
+	var out []model.Gate
+	for _, c := range shellCommands(lines, 1) {
+		out = append(out, model.Gate{
+			ID: fmt.Sprintf("%s::%d", rel, c.line), Kind: model.KindGitHook,
+			File: rel, Line: c.line, Name: c.run, Run: c.run, Stage: stage,
+		})
+	}
+	return out
+}
+
+// runnableHook reports whether git would run the hook at all. git silently skips
+// a hook that is not executable, so one committed without +x enforces nothing.
+// husky is the exception: it runs its hooks through sh, executable or not. A
+// filesystem with no executable bit cannot answer, and is given the benefit.
+func runnableHook(path, rel string) bool {
+	if filepath.Base(filepath.Dir(rel)) == ".husky" || runtime.GOOS == "windows" {
+		return true
+	}
+	fi, err := os.Stat(path)
+	return err == nil && fi.Mode()&0o111 != 0
 }
 
 func isCheckish(s string) bool {

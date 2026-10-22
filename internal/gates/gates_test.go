@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -348,5 +349,68 @@ func TestQuotedSrcRootIsTheSpecDirectory(t *testing.T) {
 		if got := srcRoot(tc.in, tc.dir); got != tc.want {
 			t.Errorf("srcRoot(%q, %q) = %q, want %q", tc.in, tc.dir, got, tc.want)
 		}
+	}
+}
+
+// A git hook the repository ships is a gate at the hook's stage, one per command,
+// and a checker it runs is lifted to that stage.
+func TestShippedGitHooksAreGates(t *testing.T) {
+	root := fixture(t, map[string]string{
+		"check_secrets.sh": "exit 0\n",
+		".githooks/pre-push": "#!/bin/sh\n# the local CI\nset -e\nexport GOFLAGS=-mod=mod\n" +
+			"echo running gates\nmake deps\nexec ./check_secrets.sh \\\n  --strict\n",
+		".husky/pre-commit":   "npx lint-staged\n",
+		".husky/post-commit":  "make notify\n",
+		".husky/_/husky.sh":   "make internals\n",
+		".git-hooks/README":   "make docs\n",
+		"scripts/pre-push.sh": "make nothing\n",
+	})
+	// fixture writes 0600; git runs only an executable hook.
+	for _, h := range []string{".githooks/pre-push", ".husky/post-commit"} {
+		if err := os.Chmod(filepath.Join(root, filepath.FromSlash(h)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gs := Promote(must(Discover(root)))
+	var runs []string
+	for _, g := range gs {
+		if g.Kind == model.KindGitHook {
+			runs = append(runs, string(g.Stage)+" "+g.Run)
+		}
+	}
+	want := []string{ // sorted by gate id: .githooks before .husky
+		"pre-push make deps",
+		"pre-push ./check_secrets.sh --strict",
+		"pre-commit npx lint-staged",
+	}
+	if strings.Join(runs, "|") != strings.Join(want, "|") {
+		t.Errorf("hook gates = %q, want %q", runs, want)
+	}
+	if g, _ := find(gs, "check_secrets.sh"); g.Stage != model.PrePush {
+		t.Errorf("check_secrets.sh stage = %q, want pre-push - the hook runs it", g.Stage)
+	}
+}
+
+// A hook's name is git's vocabulary, not the repository's. Naming the gate after
+// it once linked "never commit a key" to a lint hook through the word "commit".
+func TestAHookNameIsNotEvidence(t *testing.T) {
+	root := fixture(t, map[string]string{".githooks/pre-commit": "#!/bin/sh\nnpx lint-staged\n"})
+	if err := os.Chmod(filepath.Join(root, ".githooks", "pre-commit"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gs, _ := Discover(root)
+	if len(gs) != 1 || gs[0].Name != "npx lint-staged" {
+		t.Errorf("hook gate should be named by its command: %+v", gs)
+	}
+}
+
+// git skips a hook that is not executable, so it is no gate.
+func TestANonExecutableHookIsNotAGate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no executable bit")
+	}
+	root := fixture(t, map[string]string{".githooks/pre-push": "make deps\n"})
+	if gs, _ := Discover(root); countKind(gs, model.KindGitHook) != 0 {
+		t.Errorf("a hook git will not run was counted: %+v", gs)
 	}
 }
