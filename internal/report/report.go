@@ -13,11 +13,6 @@ import (
 	"github.com/space-pirate-zero/hullcheck/internal/model"
 )
 
-// stages is the Time-to-Truth ladder, fastest first.
-var stages = []model.Stage{
-	model.PreCommit, model.PullReq, model.Nightly, model.Release, model.Manual,
-}
-
 // TTT summarises how long a violation survives before something catches it.
 type TTT struct {
 	ByStage map[model.Stage]int `json:"by_stage"`
@@ -97,12 +92,17 @@ func Duration(sec int) string {
 	}
 }
 
-// Text writes the human reading.
-func Text(w io.Writer, r model.Report, verified bool) {
+// Text writes the human reading. manifest says whether .hullcheck.yml exists,
+// so an unverified reading of a repository that has one does not claim it has
+// none, and does not tell its reader to overwrite it.
+func Text(w io.Writer, r model.Report, verified, manifest bool) {
 	c := r.Counts()
 	mode := "unverified - no manifest present"
-	if verified {
+	switch {
+	case verified:
 		mode = "verified against .hullcheck.yml"
+	case manifest:
+		mode = "unverified - manifest present, run --verify"
 	}
 	fmt.Fprintf(w, "HULLCHECK reading %s  (%s)\n\n", r.Root, mode)
 	fmt.Fprintf(w, "  %d rules found in %d policy document%s\n",
@@ -136,7 +136,7 @@ func Text(w io.Writer, r model.Report, verified bool) {
 	}
 	fmt.Fprintf(w, "  TIME-TO-TRUTH        p50 %-6s p90 %-6s worst %s\n",
 		Duration(t.P50), Duration(t.P90), worst)
-	for _, st := range stages {
+	for _, st := range model.Ladder {
 		if n := t.ByStage[st]; n > 0 {
 			fmt.Fprintf(w, "    %-13s %3d gates   %s\n", st, n, Duration(st.Latency()))
 		}
@@ -160,9 +160,13 @@ func Text(w io.Writer, r model.Report, verified bool) {
 	fmt.Fprintf(w, "\n  Gate Coverage  %.0f%%   weighted by severity  %.0f%%\n",
 		r.Coverage()*100, r.WeightedCoverage()*100)
 	if !verified {
+		next := "hullcheck --print-manifest > .hullcheck.yml"
+		if manifest {
+			next = "hullcheck --verify"
+		}
 		fmt.Fprint(w, "\n  This is a READING, not a score. It matched rules to gates by name\n"+
 			"  and reference; it did not prove any gate fails when its rule is broken.\n"+
-			"  Next:  hullcheck --print-manifest > .hullcheck.yml\n")
+			"  Next:  "+next+"\n")
 	}
 }
 

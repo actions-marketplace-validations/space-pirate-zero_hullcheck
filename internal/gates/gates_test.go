@@ -1,8 +1,10 @@
 package gates
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/space-pirate-zero/hullcheck/internal/model"
@@ -176,5 +178,175 @@ func TestVendoredWorkflowsAreIgnored(t *testing.T) {
 	gs, _ := Discover(root)
 	if len(gs) != 0 {
 		t.Fatalf("vendored gates leaked in: %+v", gs)
+	}
+}
+
+// An xcodegen spec's build-phase scripts run on every local build of the target,
+// so they are gates at the build stage, and a checker they invoke is lifted to it.
+func TestXcodegenBuildPhasesAreBuildStageGates(t *testing.T) {
+	root := fixture(t, map[string]string{
+		"scripts/hullcheck.sh": "exit 0\n",
+		"project.yml": `name: PhantomTiles
+options:
+  bundleIdPrefix: com.example
+targets:
+  PhantomTiles:
+    type: application
+    platform: iOS
+    preBuildScripts:
+      - name: hullcheck
+        # The policy gate.
+        script: '"${SRCROOT}/scripts/hullcheck.sh"'
+        basedOnDependencyAnalysis: false
+    postCompileScripts:
+    - script: |
+        export PATH="$PATH:/opt/homebrew/bin"
+        swiftlint --strict
+        "${SRCROOT}"/scripts/check_style.sh
+        swiftformat --lint . || true
+      name: Lint
+    info:
+      path: AppEntry/Info.plist
+  PhantomTilesTests:
+    type: bundle.unit-test
+    postBuildScripts:
+      - path: scripts/verify_bundle.sh
+        name: Verify bundle
+schemes:
+  PhantomTiles:
+    build:
+      targets:
+        PhantomTiles: all
+`,
+	})
+	gs, err := Discover(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One gate per command a phase runs. The PATH line and the "|| true" line
+	// cannot fail the build; Info.plist's path: belongs to the target.
+	var got []string
+	for _, g := range gs {
+		if g.Kind != model.KindBuildPhase {
+			continue
+		}
+		if g.Stage != model.Build {
+			t.Errorf("%s: stage %q, want build", g.ID, g.Stage)
+		}
+		got = append(got, g.Name+": "+g.Run)
+	}
+	want := []string{
+		`hullcheck: "scripts/hullcheck.sh"`,
+		"Lint: swiftlint --strict",
+		"Lint: scripts/check_style.sh",
+		"Verify bundle: scripts/verify_bundle.sh",
+	}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("build phase gates = %q, want %q", got, want)
+	}
+
+	gs = Promote(gs)
+	g, ok := find(gs, "hullcheck.sh")
+	if !ok {
+		t.Fatalf("checker script not found: %+v", gs)
+	}
+	if g.Stage != model.Build {
+		t.Errorf("scripts/hullcheck.sh stage = %q, want build - a build phase runs it", g.Stage)
+	}
+}
+
+func TestXcodegenSpecInASubdirectoryKeepsPathsRepoRelative(t *testing.T) {
+	root := fixture(t, map[string]string{
+		"ios/scripts/check_assets.sh": "exit 0\n",
+		"ios/project.yml": "targets:\n  App:\n    preBuildScripts:\n" +
+			"      - script: $SRCROOT/scripts/check_assets.sh\n" +
+			"      - path: scripts/check_assets.sh\n",
+	})
+	gs := Promote(must(Discover(root)))
+	var runs []string
+	for _, g := range gs {
+		if g.Kind == model.KindBuildPhase {
+			runs = append(runs, g.Run)
+		}
+	}
+	if len(runs) != 2 || runs[0] != "ios/scripts/check_assets.sh" || runs[1] != "ios/scripts/check_assets.sh" {
+		t.Errorf("build phase runs = %q, want both repo-relative", runs)
+	}
+	if g, _ := find(gs, "check_assets.sh"); g.Stage != model.Build {
+		t.Errorf("check_assets.sh stage = %q, want build", g.Stage)
+	}
+}
+
+func TestProjectYmlThatIsNotXcodegenYieldsNothing(t *testing.T) {
+	root := fixture(t, map[string]string{
+		"project.yml": "name: docs\nsettings:\n  preBuildScripts:\n    - script: ./check.sh\n",
+	})
+	gs, _ := Discover(root)
+	if n := countKind(gs, model.KindBuildPhase); n != 0 {
+		t.Errorf("a project.yml with no targets: is not an xcodegen spec: %+v", gs)
+	}
+}
+
+func countKind(gs []model.Gate, k model.Kind) int {
+	n := 0
+	for _, g := range gs {
+		if g.Kind == k {
+			n++
+		}
+	}
+	return n
+}
+
+func must(gs []model.Gate, err error) []model.Gate {
+	if err != nil {
+		panic(err)
+	}
+	return gs
+}
+
+func TestShellCommandsKeepWhatCanFail(t *testing.T) {
+	script := []string{
+		"#!/bin/sh",
+		"set -e",
+		"export PATH=/opt/bin:$PATH",
+		"GOFLAGS=-mod=mod",
+		`echo "running gates"`,
+		"if ! npm test; then echo fail; exit 1; fi",
+		"then make vet",
+		"for f in scripts/*.sh; do shellcheck \"$f\"; done",
+		"while make wait-ready; do sleep 1; done",
+		"npm run lint || true",
+		"lint() {",
+		"  exec make lint \\",
+		"    --strict",
+		"}",
+		"cat <<EOF",
+		"make not-a-gate",
+		"EOF",
+		"GOFLAGS=-mod=mod go test ./...",
+	}
+	var got []string
+	for _, c := range shellCommands(script, 1) {
+		got = append(got, fmt.Sprintf("%d %s", c.line, c.run))
+	}
+	want := []string{
+		"6 npm test", "7 make vet", `8 shellcheck "$f"`, "9 make wait-ready",
+		"12 make lint --strict", "15 cat <<EOF", "18 GOFLAGS=-mod=mod go test ./...",
+	}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("commands =\n  %q\nwant\n  %q", got, want)
+	}
+}
+
+func TestQuotedSrcRootIsTheSpecDirectory(t *testing.T) {
+	for _, tc := range []struct{ in, dir, want string }{
+		{`"${SRCROOT}"/scripts/x.sh`, "ios", "ios/scripts/x.sh"},
+		{`"${SRCROOT}/scripts/x.sh"`, ".", `"scripts/x.sh"`},
+		{`$(PROJECT_DIR)/x.sh --fast`, ".", "x.sh --fast"},
+		{`"$SRCROOT"/x.sh`, "app", "app/x.sh"},
+	} {
+		if got := srcRoot(tc.in, tc.dir); got != tc.want {
+			t.Errorf("srcRoot(%q, %q) = %q, want %q", tc.in, tc.dir, got, tc.want)
+		}
 	}
 }

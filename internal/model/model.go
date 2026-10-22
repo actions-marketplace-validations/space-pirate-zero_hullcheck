@@ -56,9 +56,12 @@ type Stage string
 
 const (
 	PreCommit Stage = "pre-commit"
-	PullReq   Stage = "pull-request"
-	Nightly   Stage = "nightly"
-	Release   Stage = "release"
+	// Build: a build phase of the project itself, such as an Xcode run-script
+	// phase. It runs on every local build, before anything reaches a commit.
+	Build   Stage = "build"
+	PullReq Stage = "pull-request"
+	Nightly Stage = "nightly"
+	Release Stage = "release"
 	// Manual: the gate exists and works, but nothing schedules it. It runs only
 	// when a human remembers to run it, which is not a detection latency.
 	Manual Stage = "manual"
@@ -72,6 +75,8 @@ func (s Stage) Latency() int {
 	switch s {
 	case PreCommit:
 		return 10
+	case Build:
+		return 2 * 60
 	case PullReq:
 		return 12 * 60
 	case Nightly:
@@ -83,23 +88,20 @@ func (s Stage) Latency() int {
 	}
 }
 
+// Ladder is the Time-to-Truth ladder, fastest first. It is the one place the
+// order is written down: Rank reads it, and so does every report that prints
+// the ladder, so a stage cannot be ranked and then left out of the table.
+var Ladder = []Stage{PreCommit, Build, PullReq, Nightly, Release, Manual}
+
 // Rank orders stages fastest to slowest for sorting and for picking the best
-// gate when a rule has several.
+// gate when a rule has several. Never, and anything not on the ladder, is last.
 func (s Stage) Rank() int {
-	switch s {
-	case PreCommit:
-		return 0
-	case PullReq:
-		return 1
-	case Nightly:
-		return 2
-	case Release:
-		return 3
-	case Manual:
-		return 4
-	default:
-		return 5
+	for i, st := range Ladder {
+		if st == s {
+			return i
+		}
 	}
+	return len(Ladder)
 }
 
 // Kind is how a gate is executed.
@@ -112,6 +114,9 @@ const (
 	KindMakefile  Kind = "makefile"
 	KindOPA       Kind = "opa"
 	KindTest      Kind = "test"
+	// KindBuildPhase is a script the project's own build runs, e.g. an Xcode
+	// pre- or post-build script declared in an xcodegen project.yml.
+	KindBuildPhase Kind = "build-phase"
 )
 
 // Rule is a stated constraint found in a policy document.
